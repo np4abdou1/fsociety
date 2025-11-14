@@ -1,0 +1,73 @@
+name: Build and Release
+
+# Manual trigger only - won't run automatically on commits
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+      release_notes:
+        description: 'Release notes'
+        required: false
+        default: 'New release'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+      
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      
+      - name: Build project
+        run: .\make.bat
+        shell: cmd
+      
+      - name: Create release package
+        run: |
+          mkdir release
+          copy chromelevator.exe release\
+          copy README.md release\
+          copy LICENSE release\
+          mkdir release\docs
+          copy docs\*.md release\docs\
+        shell: cmd
+      
+      - name: Create ZIP archive
+        run: |
+          Compress-Archive -Path release\* -DestinationPath ChromeElevator-${{ github.event.inputs.version }}.zip
+        shell: powershell
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: ChromeElevator ${{ github.event.inputs.version }}
+          body: ${{ github.event.inputs.release_notes }}
+          draft: false
+          prerelease: false
+          files: |
+            ChromeElevator-${{ github.event.inputs.version }}.zip
+            chromelevator.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChromeElevator-${{ github.event.inputs.version }}
+          path: |
+            chromelevator.exe
+            build/chrome_decrypt.dll

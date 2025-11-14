@@ -1,4 +1,5 @@
 # Build artifacts
+build/
 *.obj
 *.dll
 *.exe
@@ -6,6 +7,8 @@
 *.pdb
 *.ilk
 *.exp
+*.res
+*.enc
 output/
 src/*.obj
 src/*.dll
@@ -14,8 +17,24 @@ src/*.lib
 libs/sqlite/*.obj
 libs/sqlite/*.lib
 
+# Release packages
+release/
+*.zip
+*.rar
+*.7z
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
 # VS Code
 .vscode/
+*.code-workspace
 
 # Temp files from DLL
 /chrome_decrypt.log
@@ -24,5 +43,13 @@ libs/sqlite/*.lib
 /*_decrypt_cookies.txt
 /*_decrypt_passwords.txt
 /*_decrypt_payments.txt
-/.vscode
-/build
+*.tmp
+*.log
+*.bak
+*.swp
+*~
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
