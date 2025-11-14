@@ -13,6 +13,10 @@ on:
         required: false
         default: 'New release'
 
+# Grant permissions to create releases
+permissions:
+  contents: write
+  
 jobs:
   build:
     runs-on: windows-latest
