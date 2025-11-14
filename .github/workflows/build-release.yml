@@ -39,10 +39,11 @@ jobs:
         run: |
           mkdir release
           copy chromelevator.exe release\
-          copy README.md release\
-          copy LICENSE release\
-          mkdir release\docs
-          copy docs\*.md release\docs\
+          if exist README.md copy README.md release\
+          if exist LICENSE copy LICENSE release\
+          if exist CHANGELOG.md copy CHANGELOG.md release\
+          if exist docs mkdir release\docs
+          if exist docs\*.md copy docs\*.md release\docs\
         shell: cmd
       
       - name: Create ZIP archive
